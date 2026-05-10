@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   RefreshCcw,
   Trophy,
@@ -27,7 +27,7 @@ import PageHeader from "../components/PageHeader";
 import KpiCard from "../components/KpiCard";
 import SectionCard from "../components/SectionCard";
 import GlassButton from "../components/GlassButton";
-import { getModelMetrics, getModelPredictions, getModels } from "../lib/api";
+import { getModelMetrics, getModelPredictions, getModels, apiUrl, peekCachedApiUrl } from "../lib/api";
 import { formatDecimal } from "../lib/format";
 
 const LOG = "[MASEER]";
@@ -637,8 +637,10 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
   const allowStaticFallback = apiOnline !== true;
 
   const [metricsPack, setMetricsPack] = useState(null);
-  const [metricsLoading, setMetricsLoading] = useState(true);
+  const [metricsLoading, setMetricsLoading] = useState(false);
+  const [metricsRefreshing, setMetricsRefreshing] = useState(false);
   const [metricsError, setMetricsError] = useState(null);
+  const metricsPackRef = useRef(null);
 
   const [modelsMetaOk, setModelsMetaOk] = useState(true);
 
@@ -647,15 +649,43 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
   const [predictions, setPredictions] = useState([]);
   const [predLoading, setPredLoading] = useState(false);
   const [predError, setPredError] = useState(null);
+  const [predRefreshing, setPredRefreshing] = useState(false);
+  const predictionsRef = useRef([]);
 
-  const loadMetrics = useCallback(async () => {
-    setMetricsLoading(true);
+  useEffect(() => {
+    metricsPackRef.current = metricsPack;
+  }, [metricsPack]);
+  useEffect(() => {
+    predictionsRef.current = predictions;
+  }, [predictions]);
+
+  useLayoutEffect(() => {
+    if (apiOnline === null) return;
+    const raw = peekCachedApiUrl(apiUrl("models/metrics"));
+    if (raw?.ok && raw.data && (Array.isArray(raw.data.rows) || Array.isArray(raw.data.model_metrics))) {
+      const rows = Array.isArray(raw.data.rows) ? raw.data.rows : raw.data.model_metrics;
+      const pack = {
+        model_metrics: rows,
+        forecast_metrics: raw.data.forecast_metrics ?? rows.filter((m) => m.scenario === "24h_forecast"),
+        contextual_comparison: raw.data.contextual_comparison ?? [],
+        best_tabular_model: raw.data.best_tabular_model,
+        best_forecast_model: raw.data.best_forecast_model,
+      };
+      metricsPackRef.current = pack;
+      setMetricsPack(pack);
+    }
+  }, [apiOnline]);
+
+  const loadMetrics = useCallback(async ({ forceRefresh = false } = {}) => {
     setMetricsError(null);
     try {
       if (apiOnline === null) return;
+      const hasData = metricsPackRef.current != null;
+      if (!hasData && !forceRefresh) setMetricsLoading(true);
+      if (hasData && forceRefresh) setMetricsRefreshing(true);
       const [mm, gm] = await Promise.all([
-        getModelMetrics({ allowStaticFallback }),
-        getModels({ allowStaticFallback }),
+        getModelMetrics({ allowStaticFallback, forceRefresh }),
+        getModels({ allowStaticFallback, forceRefresh }),
       ]);
       if (gm.ok === false) {
         setModelsMetaOk(false);
@@ -666,12 +696,13 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
       if (mm.ok === false) {
         console.warn(`${LOG} model metrics:`, mm.error);
         setMetricsError(mm.error || "Failed to load metrics");
-        setMetricsPack(null);
+        if (!hasData) setMetricsPack(null);
       } else {
         setMetricsPack(mm.data ?? null);
       }
     } finally {
       setMetricsLoading(false);
+      setMetricsRefreshing(false);
     }
   }, [allowStaticFallback, apiOnline]);
 
@@ -680,9 +711,11 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
   }, [loadMetrics]);
 
   const loadPredictionsForModel = useCallback(
-    async (modelName) => {
+    async (modelName, { forceRefresh = false } = {}) => {
       if (!modelName || modelName === OVERVIEW_TAB) return;
-      setPredLoading(true);
+      const hasPreds = (predictionsRef.current?.length ?? 0) > 0;
+      if (!hasPreds && !forceRefresh) setPredLoading(true);
+      if (hasPreds && forceRefresh) setPredRefreshing(true);
       setPredError(null);
       try {
         if (apiOnline === null) return;
@@ -690,16 +723,18 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
           model: modelName,
           limit: 2400,
           allowStaticFallback,
+          forceRefresh,
         });
         if (pr.ok === false) {
           console.warn(`${LOG} model predictions:`, pr.error);
           setPredError(pr.error || "Failed");
-          setPredictions([]);
+          if (!hasPreds) setPredictions([]);
         } else {
           setPredictions(pr.rows ?? []);
         }
       } finally {
         setPredLoading(false);
+        setPredRefreshing(false);
       }
     },
     [allowStaticFallback, apiOnline]
@@ -907,15 +942,20 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
         <GlassButton
           variant="primary"
           onClick={async () => {
-            await loadMetrics();
-            if (activeTab !== OVERVIEW_TAB) await loadPredictionsForModel(activeTab);
+            await loadMetrics({ forceRefresh: true });
+            if (activeTab !== OVERVIEW_TAB)
+              await loadPredictionsForModel(activeTab, { forceRefresh: true });
           }}
-          disabled={metricsLoading}
+          disabled={metricsLoading && metricsPack == null}
         >
           <RefreshCcw size={16} strokeWidth={1.75} />
           Refresh metrics
         </GlassButton>
       </PageHeader>
+
+      {metricsRefreshing ? (
+        <p className="-mt-2 text-xs font-semibold text-brand-muted">Updating…</p>
+      ) : null}
 
       <p className="-mt-2 text-xs leading-relaxed text-brand-muted">
         Metrics evaluate pickup-count prediction, not direct passenger waiting-time labels.
@@ -942,7 +982,7 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
 
       {/* KPI cards */}
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-        {metricsLoading ? (
+        {metricsLoading && metricsPack == null ? (
           <>
             <KpiSkeleton />
             <KpiSkeleton />
@@ -1014,7 +1054,7 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
         )}
       </div>
 
-      {!metricsLoading && !metricsError ? (
+      {!metricsLoading && !metricsError && metricsPack != null ? (
         <p className="text-xs leading-relaxed text-brand-muted">
           Sequence models are evaluated separately because they target temporal forecasting behavior
           rather than the same tabular next-hour comparison.
@@ -1058,7 +1098,7 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
       </section>
 
       {/* Tab body */}
-      {!metricsError && !metricsLoading ? (
+      {!metricsError && !(metricsLoading && metricsPack == null) ? (
         activeTab === OVERVIEW_TAB ? (
           <div className="space-y-8">
             <section className="space-y-4">
@@ -1250,7 +1290,8 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
             modelRow={selectedMetricRow}
             dedupedSorted={dedupedSorted}
             contextualRows={contextual}
-            predLoading={predLoading}
+            predLoading={predLoading && predictions.length === 0}
+            predRefreshing={predRefreshing}
             predError={predError}
             predsHaveSeries={predsHaveSeries}
             contextLines={contextLines}
@@ -1258,7 +1299,7 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
             predictions={predictions}
           />
         )
-      ) : metricsLoading ? (
+      ) : metricsLoading && metricsPack == null ? (
         <div className="grid gap-4 xl:grid-cols-2">
           <ChartSkeleton className="h-[300px]" />
           <ChartSkeleton className="h-[300px]" />
@@ -1266,7 +1307,7 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
       ) : null}
 
       {/* Full metrics table */}
-      {!metricsLoading && !metricsError && dedupedSorted.length ? (
+      {!(metricsLoading && metricsPack == null) && !metricsError && dedupedSorted.length ? (
         <SectionCard
           title="Full Model Metrics Table"
           subtitle="Deduplicated holdout metrics — one row per model; groups separate tabular next-hour from sequence / forecasting."
@@ -1281,7 +1322,7 @@ export default function ModelPerformance({ overview: _overview, apiOnline }) {
       ) : null}
 
       {/* Why cards stacked → 24H section */}
-      {!metricsLoading && !metricsError ? (
+      {!(metricsLoading && metricsPack == null) && !metricsError ? (
         <div className="space-y-4">
           <ExplanationCard
             title="Why XGBoost for Next-Hour Prediction?"
@@ -1482,6 +1523,7 @@ function ModelDetailPanel({
   dedupedSorted,
   contextualRows,
   predLoading,
+  predRefreshing,
   predError,
   predsHaveSeries,
   contextLines,
@@ -1617,6 +1659,9 @@ function ModelDetailPanel({
         title="Actual vs Predicted"
         subtitle="Holdout preview trace for the selected forecasting model."
       >
+        {predRefreshing ? (
+          <p className="mb-2 text-xs font-semibold text-brand-muted">Updating…</p>
+        ) : null}
         {predLoading ? (
           <ChartSkeleton className="h-72" />
         ) : predError ? (

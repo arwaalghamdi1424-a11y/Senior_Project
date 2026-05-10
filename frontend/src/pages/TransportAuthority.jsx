@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   RefreshCcw,
   Shield,
@@ -34,6 +34,8 @@ import {
   getWeatherEventsTimeline,
   getTimestamps,
   getModelMetrics,
+  apiUrl,
+  peekCachedApiUrl,
 } from "../lib/api";
 import { formatDecimal, formatNumber, formatRatio, isoToDisplay, pressureLabel } from "../lib/format";
 
@@ -89,8 +91,54 @@ export default function TransportAuthority({ overview, refreshHealth, apiOnline 
   const [wx, setWx] = useState([]);
   const [loading, setLoading] = useState(true);
   const [fetchErrors, setFetchErrors] = useState({});
+  const snapshotRef = useRef(null);
 
   const allowStaticFallback = apiOnline !== true;
+
+  useEffect(() => {
+    snapshotRef.current = snapshot;
+  }, [snapshot]);
+
+  useLayoutEffect(() => {
+    if (apiOnline === null) return;
+    const snapParams = new URLSearchParams();
+    if (timestamp) snapParams.set("timestamp", timestamp);
+    if (model) snapParams.set("model", model);
+    const sq = snapParams.toString() ? `?${snapParams}` : "";
+    const snPeek = peekCachedApiUrl(apiUrl(`dashboard/snapshot${sq}`));
+    if (snPeek?.ok && snPeek.data && Array.isArray(snPeek.data.rows)) {
+      setSnapshot(snPeek.data);
+    }
+    const trendParams = new URLSearchParams();
+    trendParams.set("hours", "168");
+    if (model) trendParams.set("model", model);
+    const borPeek = peekCachedApiUrl(apiUrl(`borough/trend?${trendParams}`));
+    if (borPeek?.ok && Array.isArray(borPeek.data?.rows)) {
+      setBorough(borPeek.data.rows);
+    }
+    const ctPeek = peekCachedApiUrl(apiUrl(`city/trend?${trendParams}`));
+    if (ctPeek?.ok && Array.isArray(ctPeek.data?.rows)) {
+      setCity(ctPeek.data.rows);
+    }
+    const wxPeek = peekCachedApiUrl(apiUrl(`city/trend?${trendParams}`));
+    if (wxPeek?.ok && Array.isArray(wxPeek.data?.rows)) {
+      setWx(
+        wxPeek.data.rows.map((row) => ({
+          timestamp: row.timestamp,
+          temperature: row.temperature,
+          precipitation: row.precipitation,
+          snowfall: row.snowfall,
+          wind_speed: row.wind_speed,
+          humidity: row.humidity,
+          weather_status: row.weather_status,
+          total_zone_incidents: row.incident_count_sum ?? row.citywide_incident_count ?? null,
+          citywide_incident_count: row.citywide_incident_count,
+          avg_event_intensity_score: row.avg_event_intensity_score,
+          avg_disruption_score: row.avg_disruption_score,
+        }))
+      );
+    }
+  }, [apiOnline, timestamp, model]);
 
   useEffect(() => {
     if (apiOnline === null) return;
@@ -112,19 +160,20 @@ export default function TransportAuthority({ overview, refreshHealth, apiOnline 
     })();
   }, [overview?.best_tabular_model, apiOnline, allowStaticFallback]);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async ({ forceRefresh = false } = {}) => {
     if (apiOnline === null) return;
-    setLoading(true);
+    if (!snapshotRef.current && !forceRefresh) setLoading(true);
     try {
       const [sn, bor, ct, wl] = await Promise.all([
         getDashboardSnapshot({
           timestamp: timestamp || undefined,
           model: model || undefined,
           allowStaticFallback,
+          forceRefresh,
         }),
-        getBoroughTrend({ hours: 168, allowStaticFallback }),
-        getCityTrend({ hours: 168, allowStaticFallback }),
-        getWeatherEventsTimeline({ hours: 168, allowStaticFallback }),
+        getBoroughTrend({ hours: 168, allowStaticFallback, forceRefresh }),
+        getCityTrend({ hours: 168, allowStaticFallback, forceRefresh }),
+        getWeatherEventsTimeline({ hours: 168, allowStaticFallback, forceRefresh }),
       ]);
       setFetchErrors((prev) => {
         const n = { ...prev };
@@ -157,8 +206,6 @@ export default function TransportAuthority({ overview, refreshHealth, apiOnline 
   useEffect(() => {
     if (!timestamp && defaultTs) setTimestamp(defaultTs);
   }, [defaultTs, timestamp]);
-
-  const showBlocking = loading || apiOnline === null;
 
   const rows = snapshot?.rows ?? [];
 
@@ -218,6 +265,9 @@ export default function TransportAuthority({ overview, refreshHealth, apiOnline 
 
   const peak = useMemo(() => peakWindow(city), [city]);
 
+  const showBlocking = apiOnline === null || (loading && snapshot == null);
+  const panelRefreshing = loading && snapshot != null;
+
   return (
     <div className="space-y-5">
       <PageHeader title="Transport Authority View" subtitle={subtitle}>
@@ -236,8 +286,8 @@ export default function TransportAuthority({ overview, refreshHealth, apiOnline 
         <GlassButton
           variant="primary"
           onClick={() => {
-            refreshHealth?.();
-            load();
+            refreshHealth?.({ forceRefresh: true });
+            load({ forceRefresh: true });
           }}
         >
           <RefreshCcw size={16} strokeWidth={1.75} />
@@ -249,6 +299,10 @@ export default function TransportAuthority({ overview, refreshHealth, apiOnline 
         <div className="rounded-xl border border-brand-border bg-white px-4 py-3 text-sm text-brand-muted shadow-card">
           Loading regulator snapshot…
         </div>
+      ) : null}
+
+      {panelRefreshing ? (
+        <p className="text-xs font-semibold text-brand-muted">Updating…</p>
       ) : null}
 
       {!showBlocking && fetchErrors.snapshot ? (

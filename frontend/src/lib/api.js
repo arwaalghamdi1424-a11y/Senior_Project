@@ -36,6 +36,86 @@ function url(pathSuffix) {
 
 const LOG = "[MASEER]";
 
+/** Build the same absolute GET URL the client uses (for cache peek helpers). */
+export function apiUrl(relPath) {
+  const p = String(relPath).replace(/^\/+/, "");
+  return url(p);
+}
+
+/** In-memory GET response cache (successful responses only). */
+const apiCache = new Map();
+const inflightCache = new Map();
+/** Static JSON fallback file cache (keyed by relative path). */
+const staticCache = new Map();
+const staticInflight = new Map();
+/** Last successful aggregate bundle for DataInfo so navigation feels instant. */
+let lastDataInfoBundle = null;
+
+export function makeCacheKey(fullUrl) {
+  return String(fullUrl);
+}
+
+export function clearApiCache() {
+  apiCache.clear();
+  inflightCache.clear();
+  staticCache.clear();
+  staticInflight.clear();
+  lastDataInfoBundle = null;
+}
+
+export function peekCachedApiUrl(fullUrl) {
+  const hit = apiCache.get(makeCacheKey(fullUrl));
+  if (!hit?.ok) return null;
+  const r = hit.result;
+  return { ok: r.ok, data: r.data, status: r.status };
+}
+
+/** Synchronous peek for the most recent successful DataInfo aggregate. */
+export function peekCachedDataInfo() {
+  return lastDataInfoBundle;
+}
+
+async function fetchApiGetCached(fullUrl, { forceRefresh = false } = {}) {
+  const key = makeCacheKey(fullUrl);
+  const inflightKey = forceRefresh ? `${key}\u0000force` : key;
+
+  if (!forceRefresh) {
+    const cached = apiCache.get(key);
+    if (cached?.ok) {
+      console.info(`${LOG} cache hit: ${fullUrl}`);
+      return {
+        ok: cached.result.ok,
+        data: cached.result.data,
+        status: cached.result.status,
+      };
+    }
+    const waitInflight = inflightCache.get(inflightKey);
+    if (waitInflight) return waitInflight;
+  } else {
+    const waitInflight = inflightCache.get(inflightKey);
+    if (waitInflight) return waitInflight;
+  }
+
+  const p = (async () => {
+    try {
+      const res = await fetch(fullUrl, { method: "GET" });
+      const data = await res.json().catch(() => null);
+      const result = !res.ok ? { ok: false, data, status: res.status } : { ok: true, data, status: res.status };
+      if (result.ok) {
+        apiCache.set(key, { ok: true, result: { ...result }, fetchedAt: Date.now() });
+      }
+      return result;
+    } catch {
+      return { ok: false, data: null, status: 0 };
+    } finally {
+      inflightCache.delete(inflightKey);
+    }
+  })();
+
+  inflightCache.set(inflightKey, p);
+  return p;
+}
+
 function logEndpointFailure(path, status, detail = "") {
   const extra = detail ? ` ${detail}` : "";
   console.warn(`${LOG} endpoint failed: ${path} (status=${status})${extra}`);
@@ -61,8 +141,30 @@ async function fetchJsonQuiet(input, opts) {
 }
 
 async function fetchStatic(path, fallback = null) {
-  const { ok, data } = await fetchJsonQuiet(path);
-  return ok ? data : fallback;
+  const key = String(path);
+  if (staticCache.has(key)) {
+    return staticCache.get(key);
+  }
+  const inflight = staticInflight.get(key);
+  if (inflight) {
+    const cached = await inflight;
+    return cached !== undefined ? cached : fallback;
+  }
+  const p = (async () => {
+    try {
+      const { ok, data } = await fetchJsonQuiet(path);
+      if (ok) {
+        staticCache.set(key, data);
+        return data;
+      }
+      return undefined;
+    } finally {
+      staticInflight.delete(key);
+    }
+  })();
+  staticInflight.set(key, p);
+  const result = await p;
+  return result !== undefined ? result : fallback;
 }
 
 function computePressureRatio(row) {
@@ -185,9 +287,9 @@ export async function getHealth() {
   return { ok: true, data: r.data ?? {}, status: 200 };
 }
 
-export async function getOverview({ allowStaticFallback = true } = {}) {
+export async function getOverview({ allowStaticFallback = true, forceRefresh = false } = {}) {
   const path = "/api/overview";
-  const r = await fetchJsonQuiet(url("/overview"));
+  const r = await fetchApiGetCached(url("/overview"), { forceRefresh });
   if (r.ok && r.data && typeof r.data === "object") {
     return { ok: true, source: "api", data: r.data };
   }
@@ -221,10 +323,14 @@ export async function getTimestamps(zoneIdOrOpts = null, legacyOpts = {}) {
   const params = new URLSearchParams();
   let zoneId = null;
   let allowStaticFallback = true;
+  let forceRefresh = false;
   if (typeof zoneIdOrOpts === "object" && zoneIdOrOpts !== null) {
     zoneId = zoneIdOrOpts.zoneId ?? null;
     if (typeof zoneIdOrOpts.allowStaticFallback === "boolean") {
       allowStaticFallback = zoneIdOrOpts.allowStaticFallback;
+    }
+    if (typeof zoneIdOrOpts.forceRefresh === "boolean") {
+      forceRefresh = zoneIdOrOpts.forceRefresh;
     }
   } else if (zoneIdOrOpts != null) {
     zoneId = zoneIdOrOpts;
@@ -232,10 +338,13 @@ export async function getTimestamps(zoneIdOrOpts = null, legacyOpts = {}) {
   if (typeof legacyOpts.allowStaticFallback === "boolean") {
     allowStaticFallback = legacyOpts.allowStaticFallback;
   }
+  if (typeof legacyOpts.forceRefresh === "boolean") {
+    forceRefresh = legacyOpts.forceRefresh;
+  }
   if (zoneId != null) params.set("zone_id", String(zoneId));
   const q = params.toString() ? `?${params}` : "";
   const path = `/api/timestamps${q}`;
-  const r = await fetchJsonQuiet(url(`/timestamps${q}`));
+  const r = await fetchApiGetCached(url(`/timestamps${q}`), { forceRefresh });
   if (r.ok && r.data && Array.isArray(r.data.timestamps)) {
     return {
       ok: true,
@@ -274,9 +383,9 @@ export async function getTimestamps(zoneIdOrOpts = null, legacyOpts = {}) {
   };
 }
 
-export async function getModels({ allowStaticFallback = true } = {}) {
+export async function getModels({ allowStaticFallback = true, forceRefresh = false } = {}) {
   const path = "/api/models";
-  const r = await fetchJsonQuiet(url("/models"));
+  const r = await fetchApiGetCached(url("/models"), { forceRefresh });
   if (r.ok && r.data && Array.isArray(r.data.models)) {
     return {
       ok: true,
@@ -307,9 +416,9 @@ export async function getModels({ allowStaticFallback = true } = {}) {
   };
 }
 
-export async function getZones({ allowStaticFallback = true } = {}) {
+export async function getZones({ allowStaticFallback = true, forceRefresh = false } = {}) {
   const path = "/api/zones";
-  const r = await fetchJsonQuiet(url("/zones"));
+  const r = await fetchApiGetCached(url("/zones"), { forceRefresh });
   if (r.ok && r.data && Array.isArray(r.data.zones)) {
     return { ok: true, source: "api", rows: r.data.zones };
   }
@@ -362,6 +471,7 @@ export async function getDashboardSnapshot({
   borough = null,
   limit = null,
   allowStaticFallback = true,
+  forceRefresh = false,
 } = {}) {
   const params = new URLSearchParams();
   if (timestamp) params.set("timestamp", timestamp);
@@ -370,7 +480,7 @@ export async function getDashboardSnapshot({
   if (limit) params.set("limit", String(limit));
   const q = params.toString() ? `?${params}` : "";
   const path = `/api/dashboard/snapshot${q}`;
-  const r = await fetchJsonQuiet(`${url(`/dashboard/snapshot${q}`)}`);
+  const r = await fetchApiGetCached(url(`/dashboard/snapshot${q}`), { forceRefresh });
   if (r.ok && r.data && Array.isArray(r.data.rows)) {
     return { ok: true, source: "api", data: r.data };
   }
@@ -396,6 +506,7 @@ function _normalizeTrendArgs(hoursOrOpts, restArg) {
       start: o.start ?? null,
       end: o.end ?? null,
       allowStaticFallback: typeof o.allowStaticFallback === "boolean" ? o.allowStaticFallback : true,
+      forceRefresh: typeof o.forceRefresh === "boolean" ? o.forceRefresh : false,
     };
   }
   const hours = hoursOrOpts != null ? Number(hoursOrOpts) : 168;
@@ -407,20 +518,24 @@ function _normalizeTrendArgs(hoursOrOpts, restArg) {
       end: restArg.end ?? null,
       allowStaticFallback:
         typeof restArg.allowStaticFallback === "boolean" ? restArg.allowStaticFallback : true,
+      forceRefresh: typeof restArg.forceRefresh === "boolean" ? restArg.forceRefresh : false,
     };
   }
-  return { hours, model: null, start: null, end: null, allowStaticFallback: true };
+  return { hours, model: null, start: null, end: null, allowStaticFallback: true, forceRefresh: false };
 }
 
 export async function getCityTrend(hoursOrOpts = 168, restArg = null) {
-  const { hours, model, start, end, allowStaticFallback } = _normalizeTrendArgs(hoursOrOpts, restArg);
+  const { hours, model, start, end, allowStaticFallback, forceRefresh } = _normalizeTrendArgs(
+    hoursOrOpts,
+    restArg
+  );
   const params = new URLSearchParams();
   params.set("hours", String(hours));
   if (model) params.set("model", model);
   if (start) params.set("start", start);
   if (end) params.set("end", end);
   const path = `/api/city/trend?${params}`;
-  const r = await fetchJsonQuiet(url(`/city/trend?${params}`));
+  const r = await fetchApiGetCached(url(`/city/trend?${params}`), { forceRefresh });
   if (r.ok && Array.isArray(r.data?.rows)) {
     return { ok: true, source: "api", rows: r.data.rows };
   }
@@ -481,14 +596,17 @@ export async function getCityTrend(hoursOrOpts = 168, restArg = null) {
 }
 
 export async function getBoroughTrend(hoursOrOpts = 168, restArg = null) {
-  const { hours, model, start, end, allowStaticFallback } = _normalizeTrendArgs(hoursOrOpts, restArg);
+  const { hours, model, start, end, allowStaticFallback, forceRefresh } = _normalizeTrendArgs(
+    hoursOrOpts,
+    restArg
+  );
   const params = new URLSearchParams();
   params.set("hours", String(hours));
   if (model) params.set("model", model);
   if (start) params.set("start", start);
   if (end) params.set("end", end);
   const path = `/api/borough/trend?${params}`;
-  const r = await fetchJsonQuiet(url(`/borough/trend?${params}`));
+  const r = await fetchApiGetCached(url(`/borough/trend?${params}`), { forceRefresh });
   if (r.ok && Array.isArray(r.data?.rows)) {
     return { ok: true, source: "api", rows: r.data.rows };
   }
@@ -556,13 +674,16 @@ export async function getBoroughTrend(hoursOrOpts = 168, restArg = null) {
  * legacy positional form ``getZoneHistory(zoneId, hours, model)``.
  */
 export async function getZoneHistory(zoneIdOrOpts, hoursArg = 168, modelArg = null) {
-  let zoneId, hours, model, allowStaticFallback = true;
+  let zoneId, hours, model, allowStaticFallback = true, forceRefresh = false;
   if (typeof zoneIdOrOpts === "object" && zoneIdOrOpts !== null) {
     zoneId = zoneIdOrOpts.zoneId;
     hours = Number(zoneIdOrOpts.hours ?? 168);
     model = zoneIdOrOpts.model ?? null;
     if (typeof zoneIdOrOpts.allowStaticFallback === "boolean") {
       allowStaticFallback = zoneIdOrOpts.allowStaticFallback;
+    }
+    if (typeof zoneIdOrOpts.forceRefresh === "boolean") {
+      forceRefresh = zoneIdOrOpts.forceRefresh;
     }
   } else {
     zoneId = zoneIdOrOpts;
@@ -573,9 +694,9 @@ export async function getZoneHistory(zoneIdOrOpts, hoursArg = 168, modelArg = nu
   params.set("hours", String(hours));
   if (model) params.set("model", model);
   const path = `/api/zone/${encodeURIComponent(zoneId)}/history?${params}`;
-  const r = await fetchJsonQuiet(
-    url(`/zone/${encodeURIComponent(zoneId)}/history?${params}`)
-  );
+  const r = await fetchApiGetCached(url(`/zone/${encodeURIComponent(zoneId)}/history?${params}`), {
+    forceRefresh,
+  });
   if (r.ok && Array.isArray(r.data?.rows)) {
     return { ok: true, source: "api", rows: r.data.rows };
   }
@@ -623,7 +744,7 @@ export async function getZoneHistory(zoneIdOrOpts, hoursArg = 168, modelArg = nu
  * the legacy positional form ``getZoneHourHeatmap(hours, topN)``.
  */
 export async function getZoneHourHeatmap(hoursOrOpts = 168, topNArg = 20, restArg = null) {
-  let hours, topN, model, metric, allowStaticFallback = true;
+  let hours, topN, model, metric, allowStaticFallback = true, forceRefresh = false;
   if (typeof hoursOrOpts === "object" && hoursOrOpts !== null) {
     hours = Number(hoursOrOpts.hours ?? 168);
     topN = Number(hoursOrOpts.topN ?? hoursOrOpts.top_n ?? 20);
@@ -631,6 +752,9 @@ export async function getZoneHourHeatmap(hoursOrOpts = 168, topNArg = 20, restAr
     metric = hoursOrOpts.metric ?? "pressure_ratio";
     if (typeof hoursOrOpts.allowStaticFallback === "boolean") {
       allowStaticFallback = hoursOrOpts.allowStaticFallback;
+    }
+    if (typeof hoursOrOpts.forceRefresh === "boolean") {
+      forceRefresh = hoursOrOpts.forceRefresh;
     }
   } else {
     hours = Number(hoursOrOpts ?? 168);
@@ -640,6 +764,9 @@ export async function getZoneHourHeatmap(hoursOrOpts = 168, topNArg = 20, restAr
     if (restArg && typeof restArg.allowStaticFallback === "boolean") {
       allowStaticFallback = restArg.allowStaticFallback;
     }
+    if (restArg && typeof restArg.forceRefresh === "boolean") {
+      forceRefresh = restArg.forceRefresh;
+    }
   }
   const params = new URLSearchParams();
   params.set("hours", String(hours));
@@ -647,7 +774,7 @@ export async function getZoneHourHeatmap(hoursOrOpts = 168, topNArg = 20, restAr
   if (model) params.set("model", model);
   if (metric) params.set("metric", metric);
   const path = `/api/heatmap/zone-hour?${params}`;
-  const r = await fetchJsonQuiet(url(`/heatmap/zone-hour?${params}`));
+  const r = await fetchApiGetCached(url(`/heatmap/zone-hour?${params}`), { forceRefresh });
   if (r.ok && Array.isArray(r.data?.rows)) {
     return { ok: true, source: "api", rows: r.data.rows };
   }
@@ -686,9 +813,9 @@ export async function getZoneHourHeatmap(hoursOrOpts = 168, topNArg = 20, restAr
   };
 }
 
-export async function getTaxiZonesGeoJson({ allowStaticFallback = true } = {}) {
+export async function getTaxiZonesGeoJson({ allowStaticFallback = true, forceRefresh = false } = {}) {
   const path = "/api/map/taxi-zones";
-  const r = await fetchJsonQuiet(url("/map/taxi-zones"));
+  const r = await fetchApiGetCached(url("/map/taxi-zones"), { forceRefresh });
   if (r.ok && r.data && Array.isArray(r.data.features)) {
     return { ok: true, source: "api", data: r.data };
   }
@@ -712,9 +839,9 @@ export async function getTaxiZonesGeoJson({ allowStaticFallback = true } = {}) {
 // Models / metrics / predictions
 // ---------------------------------------------------------------------------
 
-export async function getModelMetrics({ allowStaticFallback = true } = {}) {
+export async function getModelMetrics({ allowStaticFallback = true, forceRefresh = false } = {}) {
   const path = "/api/models/metrics";
-  const r = await fetchJsonQuiet(url("/models/metrics"));
+  const r = await fetchApiGetCached(url("/models/metrics"), { forceRefresh });
   if (r.ok && r.data && (Array.isArray(r.data.rows) || Array.isArray(r.data.model_metrics))) {
     const rows = Array.isArray(r.data.rows) ? r.data.rows : r.data.model_metrics;
     return {
@@ -766,6 +893,7 @@ export async function getModelPredictions({
   end = null,
   limit = 5000,
   allowStaticFallback = true,
+  forceRefresh = false,
 } = {}) {
   const params = new URLSearchParams();
   if (model) params.set("model", model);
@@ -775,7 +903,7 @@ export async function getModelPredictions({
   if (end) params.set("end", end);
   if (limit) params.set("limit", String(limit));
   const path = `/api/models/predictions?${params}`;
-  const r = await fetchJsonQuiet(url(`/models/predictions?${params}`));
+  const r = await fetchApiGetCached(url(`/models/predictions?${params}`), { forceRefresh });
   if (r.ok && Array.isArray(r.data?.rows)) {
     return { ok: true, source: "api", rows: r.data.rows };
   }
@@ -833,9 +961,9 @@ export async function runSimulation(payload) {
 // Figures
 // ---------------------------------------------------------------------------
 
-export async function getFigures({ allowStaticFallback = true } = {}) {
+export async function getFigures({ allowStaticFallback = true, forceRefresh = false } = {}) {
   const path = "/api/figures";
-  const r = await fetchJsonQuiet(url("/figures"));
+  const r = await fetchApiGetCached(url("/figures"), { forceRefresh });
   if (r.ok && Array.isArray(r.data?.figures)) {
     return { ok: true, source: "api", rows: r.data.figures };
   }
@@ -862,16 +990,22 @@ export async function getFigures({ allowStaticFallback = true } = {}) {
 export async function getWeatherEventsTimeline(hoursOrOpts = 168) {
   let hours = 168;
   let allowStaticFallback = true;
+  let forceRefresh = false;
   if (typeof hoursOrOpts === "object" && hoursOrOpts !== null) {
     hours = Number(hoursOrOpts.hours ?? 168);
     if (typeof hoursOrOpts.allowStaticFallback === "boolean") {
       allowStaticFallback = hoursOrOpts.allowStaticFallback;
     }
+    if (typeof hoursOrOpts.forceRefresh === "boolean") {
+      forceRefresh = hoursOrOpts.forceRefresh;
+    }
   } else {
     hours = Number(hoursOrOpts ?? 168);
   }
   const path = `/api/city/trend?hours=${encodeURIComponent(hours)}`;
-  const r = await fetchJsonQuiet(url(`/city/trend?hours=${encodeURIComponent(hours)}`));
+  const r = await fetchApiGetCached(url(`/city/trend?hours=${encodeURIComponent(hours)}`), {
+    forceRefresh,
+  });
   if (r.ok && Array.isArray(r.data?.rows)) {
     return {
       ok: true,
@@ -902,16 +1036,16 @@ export async function getWeatherEventsTimeline(hoursOrOpts = 168) {
   return { ok: true, source: "static", rows: [] };
 }
 
-export async function getDataInfo({ allowStaticFallback = true } = {}) {
+export async function getDataInfo({ allowStaticFallback = true, forceRefresh = false } = {}) {
   const [overview, mm, ds, fd, eis] = await Promise.all([
-    getOverview({ allowStaticFallback }),
-    getModelMetrics({ allowStaticFallback }),
+    getOverview({ allowStaticFallback, forceRefresh }),
+    getModelMetrics({ allowStaticFallback, forceRefresh }),
     fetchStatic(FALLBACK_PATHS.dataset_summary, {}),
     fetchStatic(FALLBACK_PATHS.feature_dictionary, []),
     fetchStatic(FALLBACK_PATHS.event_integration_summary, []),
   ]);
   const apiSliceOk = overview.ok !== false && mm.ok !== false;
-  return {
+  const bundle = {
     ok: apiSliceOk,
     source: overview.source === "api" && mm.source === "api" ? "api" : overview.source,
     data: {
@@ -932,4 +1066,43 @@ export async function getDataInfo({ allowStaticFallback = true } = {}) {
       modelMetrics: mm.ok === false ? mm.error ?? "model metrics failed" : null,
     },
   };
+  if (apiSliceOk && bundle.data) {
+    lastDataInfoBundle = bundle;
+  }
+  return bundle;
+}
+
+/**
+ * Warm common GET endpoints in the background after `/api/health` succeeds.
+ * Failures are ignored; successful responses populate the GET cache.
+ */
+export async function prefetchCoreData() {
+  const allowStaticFallback = false;
+  try {
+    const tsRes = await getTimestamps({ allowStaticFallback });
+    const tsLatest =
+      tsRes.ok !== false && Array.isArray(tsRes.rows) && tsRes.rows.length ? tsRes.rows[0] : null;
+    await Promise.allSettled([
+      getOverview({ allowStaticFallback }),
+      getModels({ allowStaticFallback }),
+      getModelMetrics({ allowStaticFallback }),
+      getTaxiZonesGeoJson({ allowStaticFallback }),
+      getCityTrend({ hours: 168, allowStaticFallback }),
+      getBoroughTrend({ hours: 168, allowStaticFallback }),
+      getZoneHourHeatmap({
+        hours: 168,
+        topN: 20,
+        metric: "pressure_ratio",
+        allowStaticFallback,
+      }),
+      tsLatest
+        ? getDashboardSnapshot({ timestamp: tsLatest, allowStaticFallback })
+        : getDashboardSnapshot({ allowStaticFallback }),
+      getFigures({ allowStaticFallback: true }),
+      getDataInfo({ allowStaticFallback: true }),
+    ]);
+  } catch {
+    /* ignore */
+  }
+  console.info(`${LOG} prefetch complete`);
 }

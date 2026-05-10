@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { FlaskConical, RefreshCcw, Play } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import KpiCard from "../components/KpiCard";
@@ -12,6 +12,8 @@ import {
   getModelMetrics,
   runSimulation,
   getDashboardSnapshot,
+  apiUrl,
+  peekCachedApiUrl,
 } from "../lib/api";
 import { formatDecimal, formatNumber } from "../lib/format";
 import {
@@ -57,6 +59,32 @@ export default function SimulationLab({ overview, refreshHealth, apiOnline }) {
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
 
+  useLayoutEffect(() => {
+    if (apiOnline === null) return;
+    const zPeek = peekCachedApiUrl(apiUrl("zones"));
+    if (zPeek?.ok && zPeek.data && (Array.isArray(zPeek.data.zones) || Array.isArray(zPeek.data.rows))) {
+      const rows = Array.isArray(zPeek.data.zones) ? zPeek.data.zones : zPeek.data.rows;
+      setZones(rows);
+      setZoneId((prev) =>
+        prev || (rows?.[0]?.zone_id != null ? String(rows[0].zone_id) : "")
+      );
+    }
+    const mmPeek = peekCachedApiUrl(apiUrl("models/metrics"));
+    if (
+      mmPeek?.ok &&
+      mmPeek.data &&
+      (Array.isArray(mmPeek.data.rows) || Array.isArray(mmPeek.data.model_metrics))
+    ) {
+      const mrows = Array.isArray(mmPeek.data.rows) ? mmPeek.data.rows : mmPeek.data.model_metrics;
+      const names = [...new Set((mrows ?? []).map((m) => m.model_name).filter(Boolean))];
+      const opts = [
+        ...new Set([mmPeek.data.best_tabular_model, overview?.best_tabular_model, ...names].filter(Boolean)),
+      ];
+      setModels(opts);
+      setModel((p) => p || String(opts[0] || ""));
+    }
+  }, [apiOnline, overview?.best_tabular_model]);
+
   useEffect(() => {
     if (apiOnline === null) return;
     (async () => {
@@ -101,12 +129,13 @@ export default function SimulationLab({ overview, refreshHealth, apiOnline }) {
     })();
   }, [zoneId, apiOnline, allowStaticFallback]);
 
-  async function hydrateFromSnapshot() {
+  async function hydrateFromSnapshot({ forceRefresh = false } = {}) {
     if (!zoneId || apiOnline === null) return;
     const snap = await getDashboardSnapshot({
       timestamp: timestamp || undefined,
       model: model || undefined,
       allowStaticFallback,
+      forceRefresh,
     });
     if (snap.ok === false) {
       console.warn(`${LOG} hydrate snapshot:`, snap.error);
@@ -200,7 +229,7 @@ export default function SimulationLab({ overview, refreshHealth, apiOnline }) {
           <Play size={14} strokeWidth={2} />
           {running ? "Running…" : "Run Simulation"}
         </GlassButton>
-        <GlassButton onClick={() => refreshHealth?.()}>
+        <GlassButton onClick={() => refreshHealth?.({ forceRefresh: true })}>
           <RefreshCcw size={14} strokeWidth={1.75} />
           API pulse
         </GlassButton>

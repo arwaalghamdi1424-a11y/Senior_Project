@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   RefreshCcw,
   CloudSun,
@@ -42,6 +42,8 @@ import {
   getTimestamps,
   getModels,
   getTaxiZonesGeoJson,
+  apiUrl,
+  peekCachedApiUrl,
 } from "../lib/api";
 import { formatDecimal, formatNumber, isoToDisplay, pressureTierLabel, formatRatio } from "../lib/format";
 import { buildDashboardInsightRail } from "../lib/insights";
@@ -245,7 +247,94 @@ export default function Dashboard({ overview, refreshHealth, apiOnline }) {
   const [geoLoading, setGeoLoading] = useState(false);
   const [geoError, setGeoError] = useState(null);
 
+  const snapshotRef = useRef(null);
+  const cityRef = useRef([]);
+  const boroughTrendRef = useRef([]);
+  const heatRef = useRef([]);
+
   const allowStaticFallback = apiOnline !== true;
+
+  useEffect(() => {
+    snapshotRef.current = snapshot;
+  }, [snapshot]);
+  useEffect(() => {
+    cityRef.current = city;
+  }, [city]);
+  useEffect(() => {
+    boroughTrendRef.current = boroughTrend;
+  }, [boroughTrend]);
+  useEffect(() => {
+    heatRef.current = heat;
+  }, [heat]);
+
+  useLayoutEffect(() => {
+    if (apiOnline === null) return;
+
+    const tsPeek = peekCachedApiUrl(apiUrl("timestamps"));
+    if (tsPeek?.ok && Array.isArray(tsPeek.data?.timestamps)) {
+      const raw = tsPeek.data.timestamps;
+      const seen = new Set();
+      const unique = [];
+      for (const t of raw) {
+        const s = String(t);
+        if (seen.has(s)) continue;
+        seen.add(s);
+        unique.push(s);
+      }
+      setTimestamps(unique);
+    }
+
+    const mPeek = peekCachedApiUrl(apiUrl("models"));
+    if (mPeek?.ok && Array.isArray(mPeek.data?.models)) {
+      const opts = (mPeek.data.models ?? []).map(String);
+      setModels(opts);
+      setModel((prev) => {
+        if (prev && opts.includes(prev)) return prev;
+        if (opts.includes("XGBoost")) return "XGBoost";
+        const def = mPeek.data.default_model ? String(mPeek.data.default_model) : "";
+        if (def && opts.includes(def)) return def;
+        return opts[0] ? String(opts[0]) : prev;
+      });
+    }
+
+    const snapParams = new URLSearchParams();
+    if (timestamp) snapParams.set("timestamp", timestamp);
+    if (model) snapParams.set("model", model);
+    const sq = snapParams.toString() ? `?${snapParams}` : "";
+    const snapPeek = peekCachedApiUrl(apiUrl(`dashboard/snapshot${sq}`));
+    if (snapPeek?.ok && snapPeek.data && Array.isArray(snapPeek.data.rows)) {
+      setSnapshot(snapPeek.data);
+    }
+
+    const modelArg = model || undefined;
+    const trendParams = new URLSearchParams();
+    trendParams.set("hours", "168");
+    if (modelArg) trendParams.set("model", modelArg);
+    const ctPeek = peekCachedApiUrl(apiUrl(`city/trend?${trendParams}`));
+    if (ctPeek?.ok && Array.isArray(ctPeek.data?.rows)) {
+      setCity(ctPeek.data.rows);
+    }
+    const borPeek = peekCachedApiUrl(apiUrl(`borough/trend?${trendParams}`));
+    if (borPeek?.ok && Array.isArray(borPeek.data?.rows)) {
+      setBoroughTrend(borPeek.data.rows);
+    }
+    const hmParams = new URLSearchParams();
+    hmParams.set("hours", "168");
+    hmParams.set("top_n", "20");
+    if (modelArg) hmParams.set("model", modelArg);
+    hmParams.set("metric", "pressure_ratio");
+    const hmPeek = peekCachedApiUrl(apiUrl(`heatmap/zone-hour?${hmParams}`));
+    if (hmPeek?.ok && Array.isArray(hmPeek.data?.rows)) {
+      setHeat(hmPeek.data.rows);
+    }
+
+    const geoPeek = peekCachedApiUrl(apiUrl("map/taxi-zones"));
+    if (geoPeek?.ok && geoPeek.data?.features?.length) {
+      setGeoJson(geoPeek.data);
+      setGeoError(null);
+      setGeoLoading(false);
+    }
+  }, [apiOnline, timestamp, model]);
 
   useEffect(() => {
     if (apiOnline === null) return;
@@ -309,6 +398,14 @@ export default function Dashboard({ overview, refreshHealth, apiOnline }) {
     if (apiOnline === null) return;
     let cancel = false;
     (async () => {
+      const geoHit = peekCachedApiUrl(apiUrl("map/taxi-zones"));
+      if (geoHit?.ok && geoHit.data?.features?.length) {
+        if (cancel) return;
+        setGeoJson(geoHit.data);
+        setGeoError(null);
+        setGeoLoading(false);
+        return;
+      }
       setGeoLoading(true);
       const r = await getTaxiZonesGeoJson({ allowStaticFallback });
       if (cancel) return;
@@ -326,15 +423,17 @@ export default function Dashboard({ overview, refreshHealth, apiOnline }) {
     };
   }, [apiOnline, allowStaticFallback]);
 
-  const loadSnapshotPanel = useCallback(async () => {
+  const loadSnapshotPanel = useCallback(async ({ forceRefresh = false } = {}) => {
     if (apiOnline === null) return;
-    setSnapshotLoading(true);
+    const hasSnapshot = snapshotRef.current != null;
+    if (!hasSnapshot && !forceRefresh) setSnapshotLoading(true);
     try {
       const modelArg = model || undefined;
       const snapRes = await getDashboardSnapshot({
         timestamp: timestamp || undefined,
         model: modelArg,
         allowStaticFallback,
+        forceRefresh,
       });
 
       setFetchErrors((prev) => {
@@ -352,22 +451,27 @@ export default function Dashboard({ overview, refreshHealth, apiOnline }) {
     }
   }, [timestamp, model, apiOnline, allowStaticFallback]);
 
-  const loadAnalyticsPanels = useCallback(async () => {
+  const loadAnalyticsPanels = useCallback(async ({ forceRefresh = false } = {}) => {
     if (apiOnline === null) return;
-    setAnalyticsLoading(true);
+    const hasAny =
+      (cityRef.current?.length ?? 0) > 0 ||
+      (boroughTrendRef.current?.length ?? 0) > 0 ||
+      (heatRef.current?.length ?? 0) > 0;
+    if (!hasAny && !forceRefresh) setAnalyticsLoading(true);
     try {
       const modelArg = model || undefined;
       const [ct, bor, hm, wx] = await Promise.all([
-        getCityTrend({ hours: 168, model: modelArg, allowStaticFallback }),
-        getBoroughTrend({ hours: 168, model: modelArg, allowStaticFallback }),
+        getCityTrend({ hours: 168, model: modelArg, allowStaticFallback, forceRefresh }),
+        getBoroughTrend({ hours: 168, model: modelArg, allowStaticFallback, forceRefresh }),
         getZoneHourHeatmap({
           hours: 168,
           topN: 20,
           model: modelArg,
           metric: "pressure_ratio",
           allowStaticFallback,
+          forceRefresh,
         }),
-        getWeatherEventsTimeline({ hours: 168, allowStaticFallback }),
+        getWeatherEventsTimeline({ hours: 168, allowStaticFallback, forceRefresh }),
       ]);
 
       setFetchErrors((prev) => {
@@ -401,8 +505,11 @@ export default function Dashboard({ overview, refreshHealth, apiOnline }) {
     loadAnalyticsPanels();
   }, [loadAnalyticsPanels]);
 
-  const loadBoard = useCallback(async () => {
-    await Promise.all([loadSnapshotPanel(), loadAnalyticsPanels()]);
+  const loadBoard = useCallback(async ({ forceRefresh = false } = {}) => {
+    await Promise.all([
+      loadSnapshotPanel({ forceRefresh }),
+      loadAnalyticsPanels({ forceRefresh }),
+    ]);
   }, [loadSnapshotPanel, loadAnalyticsPanels]);
 
   /** API returns timestamps newest-first; default = latest. */
@@ -704,8 +811,8 @@ export default function Dashboard({ overview, refreshHealth, apiOnline }) {
             <button
               type="button"
               onClick={() => {
-                refreshHealth?.();
-                loadBoard();
+                refreshHealth?.({ forceRefresh: true });
+                loadBoard({ forceRefresh: true });
               }}
               className="inline-flex items-center gap-1.5 rounded-lg border border-brand-border bg-white px-2 py-1 text-[11px] font-medium text-brand-muted shadow-sm transition-colors hover:border-brand-primary/35 hover:text-brand-text"
             >

@@ -7,7 +7,7 @@ import RideHailingOps from "./pages/RideHailingOps";
 import ModelPerformance from "./pages/ModelPerformance";
 import SimulationLab from "./pages/SimulationLab";
 import DataInfo from "./pages/DataInfo";
-import { getHealth, getOverview, logFallbackMode } from "./lib/api";
+import { getHealth, getOverview, logFallbackMode, prefetchCoreData } from "./lib/api";
 import { isoToDisplay } from "./lib/format";
 
 const LOG = "[MASEER]";
@@ -28,8 +28,10 @@ export default function App() {
   const [apiOnline, setApiOnline] = useState(null);
   const [lastRefreshDisplay, setLastRefreshDisplay] = useState("");
   const healthRefreshGen = useRef(0);
+  const prefetchOnce = useRef(false);
 
-  const refreshMeta = useCallback(async () => {
+  const refreshMeta = useCallback(async (opts = {}) => {
+    const forceRefresh = opts.forceRefresh === true;
     const id = ++healthRefreshGen.current;
 
     const health = await getHealth();
@@ -39,7 +41,12 @@ export default function App() {
       console.info(`${LOG} /api/health → OK (status=${health.status})`);
       setApiOnline(true);
 
-      const ov = await getOverview({ allowStaticFallback: false });
+      if (!prefetchOnce.current) {
+        prefetchOnce.current = true;
+        void prefetchCoreData();
+      }
+
+      const ov = await getOverview({ allowStaticFallback: false, forceRefresh });
       if (id !== healthRefreshGen.current) return;
 
       if (ov.ok !== false) {
@@ -49,6 +56,7 @@ export default function App() {
       }
     } else {
       console.warn(`${LOG} /api/health → FAIL (status=${health.status})`);
+      prefetchOnce.current = false;
       setApiOnline(false);
       logFallbackMode(`/api/health did not succeed (status=${health.status}); loading exported JSON snapshots.`);
 

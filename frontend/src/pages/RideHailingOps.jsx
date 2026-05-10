@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { RefreshCcw, Car, Gauge, MapPin, BadgeAlert } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -26,6 +26,8 @@ import {
   getZoneHistory,
   getCityTrend,
   getModelMetrics,
+  apiUrl,
+  peekCachedApiUrl,
 } from "../lib/api";
 import {
   formatDecimal,
@@ -52,8 +54,41 @@ export default function RideHailingOps({ overview, refreshHealth, apiOnline }) {
   const [city, setCity] = useState([]);
   const [loading, setLoading] = useState(true);
   const [fetchErrors, setFetchErrors] = useState({});
+  const snapshotRef = useRef(null);
 
   const allowStaticFallback = apiOnline !== true;
+
+  useEffect(() => {
+    snapshotRef.current = snapshot;
+  }, [snapshot]);
+
+  useLayoutEffect(() => {
+    if (apiOnline === null) return;
+    const snapParams = new URLSearchParams();
+    if (timestamp) snapParams.set("timestamp", timestamp);
+    if (model) snapParams.set("model", model);
+    const sq = snapParams.toString() ? `?${snapParams}` : "";
+    const snPeek = peekCachedApiUrl(apiUrl(`dashboard/snapshot${sq}`));
+    if (snPeek?.ok && snPeek.data && Array.isArray(snPeek.data.rows)) {
+      setSnapshot(snPeek.data);
+    }
+    const ctParams = new URLSearchParams();
+    ctParams.set("hours", "72");
+    if (model) ctParams.set("model", model);
+    const ctPeek = peekCachedApiUrl(apiUrl(`city/trend?${ctParams}`));
+    if (ctPeek?.ok && Array.isArray(ctPeek.data?.rows)) {
+      setCity(ctPeek.data.rows);
+    }
+    if (zoneId) {
+      const hp = new URLSearchParams();
+      hp.set("hours", "72");
+      if (model) hp.set("model", model);
+      const histPeek = peekCachedApiUrl(apiUrl(`zone/${encodeURIComponent(zoneId)}/history?${hp}`));
+      if (histPeek?.ok && Array.isArray(histPeek.data?.rows)) {
+        setHistory(histPeek.data.rows);
+      }
+    }
+  }, [apiOnline, timestamp, model, zoneId]);
 
   useEffect(() => {
     if (apiOnline === null) return;
@@ -99,24 +134,26 @@ export default function RideHailingOps({ overview, refreshHealth, apiOnline }) {
     })();
   }, [zoneId, apiOnline, allowStaticFallback]);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async ({ forceRefresh = false } = {}) => {
     if (apiOnline === null) return;
-    setLoading(true);
+    if (!snapshotRef.current && !forceRefresh) setLoading(true);
     try {
       const [snap, hist, ct] = await Promise.all([
         getDashboardSnapshot({
           timestamp: timestamp || undefined,
           model: model || undefined,
           allowStaticFallback,
+          forceRefresh,
         }),
         zoneId
           ? getZoneHistory({
               zoneId: Number(zoneId),
               hours: 72,
               allowStaticFallback,
+              forceRefresh,
             })
           : Promise.resolve({ ok: true, rows: [] }),
-        getCityTrend({ hours: 72, allowStaticFallback }),
+        getCityTrend({ hours: 72, model: model || undefined, allowStaticFallback, forceRefresh }),
       ]);
       setFetchErrors((prev) => {
         const n = { ...prev };
@@ -213,7 +250,8 @@ export default function RideHailingOps({ overview, refreshHealth, apiOnline }) {
 
   const pressureAlertLabel = zoneRow?.pressure_label ?? pressureLabel(Number(zoneRow?.pressure_ratio));
 
-  const showBlocking = loading || apiOnline === null;
+  const showBlocking = apiOnline === null || (loading && snapshot == null);
+  const panelRefreshing = loading && snapshot != null;
 
   return (
     <div className="space-y-5">
@@ -231,8 +269,8 @@ export default function RideHailingOps({ overview, refreshHealth, apiOnline }) {
         <GlassButton
           variant="primary"
           onClick={() => {
-            refreshHealth?.();
-            load();
+            refreshHealth?.({ forceRefresh: true });
+            load({ forceRefresh: true });
           }}
         >
           <RefreshCcw size={16} strokeWidth={1.75} />
@@ -244,6 +282,10 @@ export default function RideHailingOps({ overview, refreshHealth, apiOnline }) {
         <div className="rounded-xl border border-brand-border bg-white px-4 py-3 text-sm text-brand-muted shadow-card">
           Syncing operator snapshot…
         </div>
+      ) : null}
+
+      {panelRefreshing ? (
+        <p className="text-xs font-semibold text-brand-muted">Updating…</p>
       ) : null}
 
       {!showBlocking && (fetchErrors.snapshot || fetchErrors.history || fetchErrors.city) ? (

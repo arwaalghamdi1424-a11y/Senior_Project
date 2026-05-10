@@ -1,11 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { RefreshCcw, Database, Sparkles, Layers, ImageIcon, Table2, CloudSun } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import KpiCard from "../components/KpiCard";
 import SectionCard from "../components/SectionCard";
 import DataTable from "../components/DataTable";
 import GlassButton from "../components/GlassButton";
-import { getDataInfo, getFigures } from "../lib/api";
+import {
+  getDataInfo,
+  getFigures,
+  apiUrl,
+  peekCachedApiUrl,
+  peekCachedDataInfo,
+} from "../lib/api";
 import { formatNumber } from "../lib/format";
 
 const LOG = "[MASEER]";
@@ -32,20 +38,46 @@ export default function DataInfo({ refreshHealth, apiOnline }) {
     "Traceability for `target_pickup_count_next_hour` across curated TLC merges — every metric remains a pickup proxy.";
 
   const [tab, setTab] = useState("overview");
-  const [bundle, setBundle] = useState(null);
-  const [figures, setFigures] = useState([]);
+  const [bundle, setBundle] = useState(() => peekCachedDataInfo()?.data ?? null);
+  const [figures, setFigures] = useState(() => {
+    const peek = peekCachedApiUrl(apiUrl("figures"));
+    if (peek?.ok && Array.isArray(peek.data?.figures)) return peek.data.figures;
+    if (peek?.ok && Array.isArray(peek.data?.rows)) return peek.data.rows;
+    return [];
+  });
   const [featQ, setFeatQ] = useState("");
   const [loading, setLoading] = useState(false);
+  const [softRefreshing, setSoftRefreshing] = useState(false);
   const [fetchErrors, setFetchErrors] = useState({});
 
-  const load = async () => {
+  useLayoutEffect(() => {
+    if (apiOnline === null) return;
+    const peekedBundle = peekCachedDataInfo();
+    if (peekedBundle?.data) {
+      setBundle((prev) => prev ?? peekedBundle.data);
+    }
+    const figPeek = peekCachedApiUrl(apiUrl("figures"));
+    if (figPeek?.ok) {
+      const next = Array.isArray(figPeek.data?.figures)
+        ? figPeek.data.figures
+        : Array.isArray(figPeek.data?.rows)
+          ? figPeek.data.rows
+          : null;
+      if (next) setFigures((prev) => (prev?.length ? prev : next));
+    }
+  }, [apiOnline]);
+
+  const load = async ({ forceRefresh = false } = {}) => {
     if (apiOnline === null) return;
     const allowStaticFallback = apiOnline !== true;
-    setLoading(true);
+    if (!bundle || forceRefresh) {
+      if (!bundle) setLoading(true);
+      else setSoftRefreshing(true);
+    }
     try {
       const [di, fg] = await Promise.all([
-        getDataInfo({ allowStaticFallback }),
-        getFigures({ allowStaticFallback }),
+        getDataInfo({ allowStaticFallback, forceRefresh }),
+        getFigures({ allowStaticFallback, forceRefresh }),
       ]);
       setBundle(di.data ?? null);
       const nextErr = {};
@@ -62,6 +94,7 @@ export default function DataInfo({ refreshHealth, apiOnline }) {
       if (fg.ok !== false) setFigures(fg.rows ?? []);
     } finally {
       setLoading(false);
+      setSoftRefreshing(false);
     }
   };
 
@@ -95,8 +128,8 @@ export default function DataInfo({ refreshHealth, apiOnline }) {
         <GlassButton
           variant="primary"
           onClick={async () => {
-            await refreshHealth?.();
-            await load();
+            await refreshHealth?.({ forceRefresh: true });
+            await load({ forceRefresh: true });
           }}
         >
           <RefreshCcw size={16} strokeWidth={1.75} />
@@ -104,8 +137,12 @@ export default function DataInfo({ refreshHealth, apiOnline }) {
         </GlassButton>
       </PageHeader>
 
-      {loading || apiOnline === null ? (
+      {apiOnline === null || (loading && bundle == null) ? (
         <div className="rounded-xl border bg-white px-4 py-3 text-sm text-brand-muted shadow-card">Refreshing metadata…</div>
+      ) : null}
+
+      {softRefreshing ? (
+        <p className="text-xs font-semibold text-brand-muted">Updating…</p>
       ) : null}
 
       {fetchErrors.dataInfo || fetchErrors.figures ? (
