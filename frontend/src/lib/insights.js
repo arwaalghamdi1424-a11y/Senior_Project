@@ -271,6 +271,119 @@ export function buildAuthorityRegulatoryRail(rows, summary, mapMetric, peakBorou
   return [card1, card2, card3, card4, card5];
 }
 
+/** Right-rail cards for Ride-Hailing Companies View (company-facing wording). */
+export function buildCompanyOperationalInsightRail(rows, summary, boroughConcentration) {
+  let topPred = null;
+  let bestPred = -Infinity;
+  for (const row of rows) {
+    const v = Number(row.predicted_next_hour_pickups ?? row.target_pickup_count_next_hour);
+    if (Number.isFinite(v) && v >= bestPred) {
+      bestPred = v;
+      topPred = row;
+    }
+  }
+
+  const topPressure = getTopPressureRow(rows);
+
+  const card1 =
+    topPred != null
+      ? {
+          title: "Highest predicted-demand zone",
+          body: `${topPred.zone_name ?? "—"} (${topPred.borough ?? "—"}) shows the strongest predicted next-hour pickup-demand indicator in this view (${formatNumber(Number(topPred.predicted_next_hour_pickups ?? topPred.target_pickup_count_next_hour), 0)} pickups).`,
+        }
+      : {
+          title: "Highest predicted-demand zone",
+          body: "No predicted pickup values in this filtered view — adjust borough or snapshot.",
+        };
+
+  const card2 =
+    topPressure != null
+      ? {
+          title: "Highest demand-pressure zone",
+          body: `${topPressure.zone_name ?? "—"} (${topPressure.borough ?? "—"}) has the highest Pressure Ratio at ${formatRatio(topPressure.pressure_ratio ?? topPressure.observed_pressure_ratio)} (${pressureLabel(Number(topPressure.pressure_ratio ?? topPressure.observed_pressure_ratio))}).`,
+        }
+      : {
+          title: "Highest demand-pressure zone",
+          body: "Pressure Ratio is not available for ranking in this view.",
+        };
+
+  const bc = boroughConcentration;
+  const card3 = {
+    title: "Borough demand concentration",
+    body:
+      bc?.name && Number.isFinite(bc?.share)
+        ? `${bc.name} accounts for about ${formatDecimal(bc.share * 100, 1)}% of predicted pickup-demand in the selected borough scope — useful for borough-level coverage review.`
+        : "Borough concentration is not available — widen scope or check snapshot rows.",
+  };
+
+  const incidentRows = rows.filter((row) => incidentContextActive(row)).length;
+  const weather =
+    summary?.weather_status ||
+    rows.find((r) => r.weather_category)?.weather_category ||
+    null;
+  const temps = rows.map((r) => Number(r.temperature)).filter(isValidNumber);
+  const avgTemp = temps.length ? temps.reduce((a, b) => a + b, 0) / temps.length : null;
+
+  const card4 = {
+    title: "Incident / weather context",
+    body: [
+      incidentRows > 0
+        ? `${incidentRows} zone row(s) include incident or disruption context indicators in this snapshot.`
+        : "Few or no incident or disruption context indicators in this snapshot slice.",
+      weather || isValidNumber(avgTemp)
+        ? ` Weather: ${weather ? String(weather) : "composite fields"}${isValidNumber(avgTemp) ? ` (~${formatDecimal(avgTemp, 1)}°C mean across zones in view).` : "."}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join(""),
+  };
+
+  const card5 = {
+    title: "Planning note",
+    body:
+      "Review coverage plans around zones with elevated pickup-demand indicators and compare repeated patterns across similar hours.",
+  };
+
+  return [card1, card2, card3, card4, card5];
+}
+
+/** Safe operational-planning bullets for company stakeholders. */
+export function buildCompanyOperationalSuggestions({
+  hasHighPredictedZone,
+  avgPressureRatio,
+  elevatedPressureZones,
+  highPressureZones,
+  incidentContextRows,
+  dominantBoroughName,
+  boroughConcentrationShare,
+}) {
+  const lines = [];
+  if (hasHighPredictedZone || highPressureZones >= 4) {
+    lines.push("Review service coverage around high predicted-demand zones.");
+  }
+  const pressureNote = "Monitor zones where demand is above the recent zone baseline (Pressure Ratio).";
+  if (Number.isFinite(avgPressureRatio) && avgPressureRatio >= 1.1) {
+    lines.push(pressureNote);
+  } else if (elevatedPressureZones >= 8 || highPressureZones >= 2) {
+    lines.push(pressureNote);
+  }
+  if (incidentContextRows >= 2) {
+    lines.push("Consider incident-context indicators when interpreting demand changes.");
+  }
+  if (
+    dominantBoroughName &&
+    Number.isFinite(boroughConcentrationShare) &&
+    boroughConcentrationShare >= 0.38
+  ) {
+    lines.push(`Compare repeated patterns in ${dominantBoroughName} across similar time windows.`);
+  }
+  const uniq = [...new Set(lines)];
+  if (!uniq.length) {
+    uniq.push("Continue routine demand monitoring; revisit if pressure or context indicators strengthen.");
+  }
+  return uniq;
+}
+
 export function buildAuthorityMonitoringRecommendations({
   highPressureCount,
   incidentContextRows,

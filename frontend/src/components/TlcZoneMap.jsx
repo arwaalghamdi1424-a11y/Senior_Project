@@ -241,7 +241,14 @@ export default function TlcZoneMap({
   }
 
   if (!geojson?.features?.length) {
-    return null;
+    return (
+      <div className="rounded-xl border border-dashed border-brand-border bg-brand-mint/20 px-4 py-3 text-sm text-brand-muted">
+        <p className="font-semibold text-brand-text">Map unavailable</p>
+        <p className="mt-1 text-xs leading-relaxed">
+          TLC zone geometry could not be loaded. Check the map export or network, then use Update view to retry.
+        </p>
+      </div>
+    );
   }
 
   return (

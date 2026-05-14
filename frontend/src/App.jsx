@@ -15,7 +15,7 @@ const LOG = "[MASEER]";
 const PAGES = [
   { id: "dashboard", label: "Dashboard", component: Dashboard },
   { id: "transport", label: "Transport Authority", component: TransportAuthority },
-  { id: "ops", label: "Ride-Hailing Ops", component: RideHailingOps },
+  { id: "ops", label: "Ride-Hailing Companies", component: RideHailingOps },
   { id: "models", label: "Model Performance", component: ModelPerformance },
   { id: "simulation", label: "Simulation Lab", component: SimulationLab },
   { id: "data", label: "Data Info", component: DataInfo },
